@@ -141,8 +141,8 @@ class ScrapeCleaner(_PluginBase):
     )
     plugin_icon = "clean.png"
     plugin_version = "1.1.0"
-    plugin_author = "your-name"
-    author_url = "https://github.com/your-name"
+    plugin_author = "misakashiny"
+    author_url = "https://github.com/misakashiny"
     plugin_config_prefix = "scrapecleaner_"
     plugin_order = 60
     auth_level = 1
