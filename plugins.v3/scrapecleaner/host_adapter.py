@@ -55,6 +55,40 @@ class TransferHistoryAdapter:
         """不可用时的原因。"""
         return self._error
 
+    def fetch_all(self, since: str = "1970-01-01") -> list[Any]:
+        """
+        拉取全部整理历史，按 id 降序（最新在前）。
+
+        为什么用 `list_by_date` 而不是 `get_by_title`：
+        - `get_by_title` 内部固化了 `count=30`，只返回 30 条，不够用；
+        - `list_by_date(date)` 的语义是「查询 date 之后的全部记录」，**不分页**。
+          传一个足够早的日期就能拿到全量，正是列表页需要的。
+
+        `date` 字段是字符串，格式 `YYYY-MM-DD HH:MM:SS`，所以字符串比较是可行的。
+        """
+        if not self._oper:
+            return []
+        try:
+            return list(self._oper.list_by_date(since) or [])
+        except Exception as error:  # noqa: BLE001
+            logger.warning(f"刮削残留清理：读取整理历史失败 - {error}")
+            return []
+
+    def delete_record(self, history_id: int) -> None:
+        """删除一条整理记录。宿主对属于整理任务的记录会静默跳过。"""
+        if not self._oper:
+            raise RuntimeError("宿主不支持整理记录操作")
+        self._oper.delete(int(history_id))
+
+    def record_exists(self, history_id: int) -> bool:
+        """复查某条整理记录是否还存在（删除后用于识别宿主的静默保护）。"""
+        if not self._oper:
+            raise RuntimeError("宿主不支持整理记录操作")
+        getter = getattr(self._oper, "get_by_id", None) or getattr(self._oper, "get", None)
+        if getter is None:
+            raise RuntimeError("宿主未提供整理记录复查接口")
+        return bool(getter(int(history_id)))
+
     def fetch_by_dest_prefix(self, dest_prefix: str, limit: int = 500) -> list[HistoryRecord]:
         """
         按目标路径前缀抓取转移记录。

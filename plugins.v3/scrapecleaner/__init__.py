@@ -31,6 +31,7 @@ qBittorrent 自己删文件、其它插件清理种子、或者插件当时没�
 from __future__ import annotations
 
 import os
+import shutil
 import threading
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
@@ -109,6 +110,14 @@ from .analyzer import (
 from .deleter import DeleteMode, DeleteResult, execute_delete
 from .exporter import export as export_report_file
 from .exporter import summary_text
+from .history_view import (
+    HistoryItem,
+    HistoryState,
+    HistorySummary,
+    build_items,
+    collect_sibling_scrap_files,
+    filter_items,
+)
 from .host_adapter import TransferHistoryAdapter
 from .library_rules import describe_rules, effective_options, parse_library_rules, resolve_rule
 
@@ -136,11 +145,11 @@ class ScrapeCleaner(_PluginBase):
     # -----------------------------------------------------------
     plugin_name = "刮削残留清理"
     plugin_desc = (
-        "扫描对账式清理：找出媒体库里已经没有对应视频的刮削文件（nfo/图片/字幕），"
-        "先出报告、人工确认后再删，带回收站与多道安全阀，配合目录级文件保护"
+        "以整理历史列表为主入口：逐条列出整理过的文件并标注目标是否已丢失，" 
+        "一键清理残留的刮削文件（nfo/图片/字幕）；另带扫描对账兜底、回收站与六道安全阀"
     )
     plugin_icon = "clean.png"
-    plugin_version = "1.1.0"
+    plugin_version = "1.2.0"
     plugin_author = "misakashiny"
     author_url = "https://github.com/misakashiny"
     plugin_config_prefix = "scrapecleaner_"
@@ -380,6 +389,47 @@ class ScrapeCleaner(_PluginBase):
         from .analyzer import SCRAP_EXTENSIONS
 
         return frozenset(SCRAP_EXTENSIONS | _to_ext_set(self._split_lines(self._extra_scrap_exts)))
+
+    # -----------------------------------------------------------
+    # 整理历史视图
+    # -----------------------------------------------------------
+    def load_history_items(self, limit: int = 0) -> List[HistoryItem]:
+        """
+        读取整理历史，并标注每条记录的当前状态。
+
+        这是详情页「整理历史列表」的数据源，也是对账扫描之外的另一条主路径：
+        不需要扫全库，只查数据库 + 判断每条目标路径是否存在。
+
+        状态含义：
+        - `alive`   目标文件还在，正常
+        - `missing` 目标文件已不存在 —— 这正是要清理的对象
+        - `unknown` 无法判断（无路径 / 转移任务记录 / 访问出错）
+
+        :param limit: 最多读多少条，0 表示全部
+        """
+        adapter = TransferHistoryAdapter()
+        if not adapter.available:
+            logger.warning(f"刮削残留清理：无法读取整理历史 - {adapter.error}")
+            return []
+        raws = adapter.fetch_all()
+        if limit and limit > 0:
+            raws = raws[:limit]
+        return build_items(raws)
+
+    @staticmethod
+    def _history_summary_text(items: List[HistoryItem]) -> str:
+        """把整理历史的统计渲染成一行说明。"""
+        summary = HistorySummary.from_items(items)
+        if not summary.total:
+            return "整理历史为空。"
+        parts = [f"共 {summary.total} 条整理记录"]
+        if summary.alive:
+            parts.append(f"正常 {summary.alive} 条")
+        if summary.missing:
+            parts.append(f"目标已丢失 {summary.missing} 条")
+        if summary.unknown:
+            parts.append(f"无法判断 {summary.unknown} 条")
+        return "，".join(parts) + "。"
 
     # -----------------------------------------------------------
     # 扫描
@@ -900,6 +950,20 @@ class ScrapeCleaner(_PluginBase):
                 "auth": "bear",
                 "summary": "查看实际生效的多库策略",
             },
+            {
+                "path": "/history-list",
+                "endpoint": self.api_history_list,
+                "methods": ["GET"],
+                "auth": "bear",
+                "summary": "整理历史列表（含目标文件状态）",
+            },
+            {
+                "path": "/history-delete",
+                "endpoint": self.api_history_delete,
+                "methods": ["POST"],
+                "auth": "bear",
+                "summary": "按整理历史删除残留文件",
+            },
         ]
 
     def api_scan(self) -> Response[dict]:
@@ -1025,8 +1089,242 @@ class ScrapeCleaner(_PluginBase):
             },
         )
 
+    def api_history_list(self, keyword: str = "", state: str = "", limit: int = 0) -> Response[dict]:
+        """
+        整理历史列表：像主程序的「整理历史」那样逐条展示，
+        并标注每条记录的目标文件现在还在不在。
+
+        参数（走 query string）：
+        - `keyword`：按标题/源路径/目标路径筛选
+        - `state`：`alive` / `missing` / `unknown`，空表示全部
+        - `limit`：最多返回多少条，0 表示全部
+        """
+        if not self.get_state():
+            return Response(success=False, message="插件未启用")
+        try:
+            all_items = self.load_history_items()
+        except Exception as error:
+            logger.error(f"刮削残留清理：读取整理历史失败 - {error}")
+            return Response(success=False, message=f"读取整理历史失败：{error}")
+
+        summary = HistorySummary.from_items(all_items)
+        filtered = filter_items(all_items, keyword=keyword, state=state, limit=limit)
+        return Response(
+            success=True,
+            data={
+                "summary": {
+                    "total": summary.total,
+                    "alive": summary.alive,
+                    "missing": summary.missing,
+                    "unknown": summary.unknown,
+                },
+                "summary_text": self._history_summary_text(all_items),
+                "count": len(filtered),
+                "items": [item.to_row() for item in filtered],
+            },
+        )
+
+    def api_history_delete(self, payload: Dict[str, Any] = Body(default=None)) -> Response[dict]:
+        """
+        按整理历史删除残留文件。
+
+        前端传的是 `history_id` 列表。后端会：
+        1. 按 id 重新查记录，**不信任前端传的路径**；
+        2. 重新判断目标文件是否真的不存在（防止报告过期）；
+        3. 删除同名的刮削文件（.nfo / 字幕 / 图片）；
+        4. 可选地删除对应的整理记录本身。
+
+        这样即使前端传来被篡改的 id，也只会作用在真实失效的记录上。
+        """
+        if not self.get_state():
+            return Response(success=False, message="插件未启用")
+        payload = payload or {}
+        ids = payload.get("ids") or []
+        if not isinstance(ids, list) or not ids:
+            return Response(success=False, message="没有选择要删除的记录")
+        if len(ids) > 2000:
+            return Response(success=False, message="单次最多处理 2000 条记录")
+
+        delete_scrap = bool(payload.get("delete_scrap", True))
+        delete_records = bool(payload.get("delete_records", True))
+
+        if not self._lock.acquire(blocking=False):
+            return Response(success=False, message="正在执行其它操作，请稍后再试")
+        try:
+            return self._do_history_delete(ids, delete_scrap, delete_records)
+        finally:
+            self._lock.release()
+
+    def _do_history_delete(
+        self, ids: List[Any], delete_scrap: bool, delete_records: bool
+    ) -> Response[dict]:
+        """整理历史删除的实际执行部分（调用方已持锁）。"""
+        wanted: set[int] = set()
+        for raw_id in ids:
+            try:
+                wanted.add(int(raw_id))
+            except (TypeError, ValueError):
+                continue
+        if not wanted:
+            return Response(success=False, message="记录 ID 无效")
+
+        # 按 id 重新查一遍，用数据库里的真实数据，不信任前端
+        items = self.load_history_items()
+        by_id = {item.history_id: item for item in items}
+        targets = [by_id[history_id] for history_id in wanted if history_id in by_id]
+        if not targets:
+            return Response(success=False, message="没有找到对应的整理记录，可能已被删除")
+
+        removed_files: List[str] = []
+        skipped: List[Dict[str, str]] = []
+        removed_dirs: List[str] = []
+        scrap_exts = self._effective_scrap_exts()
+
+        # 直接删 / 回收 走同一套策略（受多库规则控制）
+        adapter = TransferHistoryAdapter()
+        recycle_root = self._recycle_dir
+        batch_dir = ""
+        if self._delete_mode == DeleteMode.RECYCLE:
+            batch_dir = os.path.join(
+                recycle_root, datetime.now().strftime("%Y%m%d-%H%M%S")
+            )
+
+        for item in targets:
+            if item.state is not HistoryState.MISSING:
+                skipped.append({
+                    "dest": item.dest,
+                    "reason": f"状态为「{item.state.value}」，不满足删除条件",
+                })
+                continue
+
+            # 同名刮削文件（视频已不存在了，这些才是真正要清的）
+            candidates: List[str] = []
+            if delete_scrap:
+                candidates = collect_sibling_scrap_files(item.dest, scrap_exts)
+            # 视频文件本身如果意外存在，也一并按策略处理
+            if item.dest and os.path.isfile(item.dest):
+                candidates.append(item.dest)
+
+            for path in candidates:
+                outcome = self._remove_one(path, batch_dir)
+                if outcome is True:
+                    removed_files.append(path)
+                elif isinstance(outcome, str):
+                    skipped.append({"dest": path, "reason": outcome})
+
+            if removed_files:
+                parent = os.path.dirname(item.dest)
+                if parent and os.path.isdir(parent):
+                    removed_dirs.extend(self._prune_empty_dirs(parent))
+
+        # 删除整理记录本身
+        removed_records = 0
+        record_failed: List[Dict[str, Any]] = []
+        if delete_records and adapter.available:
+            for item in targets:
+                if item.state is not HistoryState.MISSING:
+                    continue
+                try:
+                    adapter.delete_record(item.history_id)
+                except Exception as error:
+                    record_failed.append({"id": item.history_id, "reason": str(error)})
+                    continue
+                # 宿主对转移任务记录是静默无效的，复查确认
+                try:
+                    if adapter.record_exists(item.history_id):
+                        record_failed.append({
+                            "id": item.history_id,
+                            "reason": "宿主保留了这条记录（可能属于转移任务）",
+                        })
+                        continue
+                except Exception:
+                    pass
+                removed_records += 1
+
+        # 记一笔历史
+        self._append_history(
+            DeleteResult(
+                deleted=removed_files if self._delete_mode == DeleteMode.REMOVE else [],
+                recycled=removed_files if self._delete_mode == DeleteMode.RECYCLE else [],
+                skipped=[(s["dest"], s["reason"]) for s in skipped],
+                removed_dirs=removed_dirs,
+            )
+        )
+
+        if self._notify and removed_files:
+            self.post_message(
+                mtype=MessageType.Plugin,
+                title="🧹 按整理历史清理完成",
+                text=(
+                    f"处理 {len(targets)} 条记录，删除 {len(removed_files)} 个文件"
+                    + (f"，清理整理记录 {removed_records} 条" if removed_records else "")
+                    + (f"，跳过 {len(skipped)} 项" if skipped else "")
+                ),
+            )
+
+        return Response(
+            success=True,
+            message=(
+                f"处理 {len(targets)} 条记录：删除 {len(removed_files)} 个文件"
+                f"，跳过 {len(skipped)} 项，整理记录删除 {removed_records} 条"
+            ),
+            data={
+                "processed": len(targets),
+                "deleted_files": removed_files[:500],
+                "deleted_count": len(removed_files),
+                "removed_records": removed_records,
+                "skipped": skipped[:200],
+                "record_failed": record_failed[:100],
+                "removed_dirs": removed_dirs[:200],
+            },
+        )
+
+    def _remove_one(self, path: str, batch_dir: str):
+        """
+        按当前删除策略处理单个文件。
+
+        :return: True 表示处理成功；字符串表示跳过原因
+        """
+        if not os.path.isfile(path):
+            return "文件不存在"
+        try:
+            if self._delete_mode == DeleteMode.RECYCLE:
+                if not batch_dir:
+                    return "回收模式未配置回收目录"
+                target = os.path.join(batch_dir, os.path.basename(path))
+                os.makedirs(os.path.dirname(target), exist_ok=True)
+                # 同名冲突时加序号，避免覆盖
+                if os.path.exists(target):
+                    import uuid
+
+                    target = f"{target}.{uuid.uuid4().hex[:6]}"
+                shutil.move(path, target)
+            else:
+                os.remove(path)
+            return True
+        except OSError as error:
+            return f"处理失败：{error}"
+
+    @staticmethod
+    def _prune_empty_dirs(start: str) -> List[str]:
+        """从 start 向上删除空目录，遇到非空目录停止。"""
+        removed: List[str] = []
+        current = start
+        for _ in range(20):  # 限制向上层数，防止误删到盘根
+            try:
+                if not os.path.isdir(current) or os.listdir(current):
+                    break
+                os.rmdir(current)
+                removed.append(current)
+            except OSError:
+                break
+            parent = os.path.dirname(current)
+            if not parent or parent == current:
+                break
+            current = parent
+        return removed
+
     def _report_to_dict(self, report: ScanReport) -> Dict[str, Any]:
-        """把扫描报告转成前端易用的结构。"""
         orphans = report.orphans
         # 按「所在媒体目录」聚合，方便用户成组勾选
         grouped: Dict[str, List[Dict[str, Any]]] = {}
@@ -1758,7 +2056,15 @@ class ScrapeCleaner(_PluginBase):
 
     def get_page(self) -> Optional[List[dict]]:
         """
-        返回详情页面：展示最近一次扫描结果，并提供分组/整体清理按钮。
+        返回详情页面。
+
+        页面结构（按使用频率排序）：
+
+        1. **整理历史列表** —— 像主程序的「整理历史」那样逐条列出整理过的文件，
+           并标注目标文件现在还在不在。这是主要的操作入口：
+           直接看到「有哪些文件整理过、现在没了」，点按钮就能清理。
+        2. **扫描对账**（补充）—— 遍历媒体库找孤立刮削文件。
+           用来兜住整理历史覆盖不到的情况（比如文件是手动挪走的）。
 
         设计说明（很重要）
         ------------------
@@ -1768,11 +2074,9 @@ class ScrapeCleaner(_PluginBase):
         - `get_page()` → `PageRender.vue`：**没有 `model`**，只能靠
           `events.click` 触发固定的 API 调用，且每次调用后整页重绘。
 
-        所以在 `get_page()` 里做「复选框勾选多选」是不可能的：`props.model`
-        不会生效，勾选状态还会在重绘后丢失。这里改用
-        「每组一个删除按钮 + 一个全部删除按钮」，参数全部在 Python 端算好；
-        需要精细挑选时，去配置页用 `pending_paths` 文本域编辑（那里 `model`
-        是真的双向绑定）。
+        所以 `get_page()` 里做「复选框勾选多选」是不可能的：`props.model`
+        不会生效，勾选状态还会在重绘后丢失。这里改成**每一行一个删除按钮**，
+        参数在 Python 端算好写进 `events.click.params`；另有「一键清理全部」按钮。
         """
         if not self.get_state():
             return [{
@@ -1784,47 +2088,187 @@ class ScrapeCleaner(_PluginBase):
                 },
             }]
 
-        if not self.library_dirs():
-            return [{
+        mode_label = "移入回收站" if self._delete_mode == DeleteMode.RECYCLE else "直接删除"
+        widgets: List[dict] = []
+
+        # ============ 第一部分：整理历史列表（主要入口）============
+        widgets.extend(self._history_page_widgets(mode_label))
+
+        # ============ 第二部分：扫描对账（补充手段）============
+        widgets.append({
+            "component": "h2",
+            "props": {"class": "mt-8 mb-2"},
+            "text": "🔍 扫描对账（补充手段）",
+        })
+        widgets.append({
+            "component": "VAlert",
+            "props": {
+                "type": "info",
+                "variant": "tonal",
+                "density": "compact",
+                "class": "mb-3",
+                "text": (
+                    "整理历史覆盖不到的残留（比如文件被手动挪走、或库外工具删的），"
+                    "用这个扫一遍全库来兜底。"
+                ),
+            },
+        })
+        widgets.extend(self._scan_page_widgets(mode_label))
+
+        return widgets
+
+    def _history_page_widgets(self, mode_label: str) -> List[dict]:
+        """渲染整理历史列表（带逐行删除按钮）。"""
+        widgets: List[dict] = [{
+            "component": "h2",
+            "props": {"class": "mb-2"},
+            "text": "📋 整理历史",
+        }]
+
+        try:
+            items = self.load_history_items()
+        except Exception as error:
+            logger.error(f"刮削残留清理：加载整理历史失败 - {error}")
+            items = []
+            widgets.append({
                 "component": "VAlert",
                 "props": {
-                    "type": "warning",
+                    "type": "error",
                     "variant": "tonal",
-                    "text": "尚未配置媒体库目录，请先在配置页填写。",
+                    "class": "mb-3",
+                    "text": f"读取整理历史失败：{error}",
                 },
-            }]
+            })
 
-        mode_label = "移入回收站" if self._delete_mode == DeleteMode.RECYCLE else "直接删除"
-        widgets: List[dict] = [
-            {
+        if not items:
+            widgets.append({
                 "component": "VAlert",
                 "props": {
                     "type": "info",
                     "variant": "tonal",
-                    "class": "mb-4",
-                    "title": "🧹 刮削残留清理",
-                    "text": (
-                        f"当前删除方式：{mode_label}。"
-                        "定时扫描只出报告不删除，删除必须在这里点按钮确认。"
-                    ),
+                    "class": "mb-3",
+                    "text": "没有读取到整理历史（可能宿主版本不支持，或还没有整理记录）。",
                 },
-            },
-        ]
+            })
+            return widgets
 
+        summary = HistorySummary.from_items(items)
+        missing_items = [item for item in items if item.state is HistoryState.MISSING]
+
+        widgets.append({
+            "component": "VAlert",
+            "props": {
+                "type": "warning" if summary.missing else "success",
+                "variant": "tonal",
+                "class": "mb-3",
+                "title": self._history_summary_text(items),
+                "text": (
+                    f"当前删除方式：{mode_label}。"
+                    "状态为「文件已丢失」的记录可以直接删掉对应的刮削文件。"
+                ),
+            },
+        })
+
+        # 一键清理全部（只在有可删项时出现）
+        if missing_items:
+            widgets.append({
+                "component": "div",
+                "props": {"class": "d-flex flex-wrap ga-2 mb-4"},
+                "content": [
+                    self._action_button(
+                        f"清理全部 {len(missing_items)} 条失效记录",
+                        "mdi-broom",
+                        "/history-delete",
+                        {"ids": [item.history_id for item in missing_items]},
+                        color="error",
+                        block=True,
+                    )
+                ],
+            })
+
+        # 列表：前 100 条，每行带一个删除按钮
+        # PageRender 不支持在表格单元格里放按钮，所以用「表格 + 按钮组」两段呈现
+        table_rows = [item.to_row() for item in items[:100]]
+        widgets.append({
+            "component": "VDataTable",
+            "props": {
+                "density": "compact",
+                "class": "mb-3",
+                "headers": [
+                    {"title": "标题", "key": "title"},
+                    {"title": "季集", "key": "season_episode"},
+                    {"title": "目标路径", "key": "dest"},
+                    {"title": "整理时间", "key": "date"},
+                    {"title": "状态", "key": "state_label"},
+                ],
+                "items": table_rows,
+                "items-per-page": 20,
+            },
+        })
+        if len(items) > 100:
+            widgets.append({
+                "component": "VAlert",
+                "props": {
+                    "type": "info",
+                    "variant": "tonal",
+                    "density": "compact",
+                    "class": "mb-3",
+                    "text": f"列表仅显示前 100 条，共 {len(items)} 条。可用下面的按钮批量处理。",
+                },
+            })
+
+        # 逐条删除按钮（只列失效的，最多 30 条，避免页面过长）
+        if missing_items:
+            widgets.append({
+                "component": "h3",
+                "props": {"class": "mt-4 mb-2"},
+                "text": f"逐条清理（显示前 30 条，共 {len(missing_items)} 条）",
+            })
+            buttons: List[dict] = []
+            for item in missing_items[:30]:
+                label = f"删除 · {item.title or '-'}"
+                if item.season:
+                    label += f" {_episode_label(item)}"
+                label += f" · {os.path.basename(item.dest) or item.dest}"
+                buttons.append(self._action_button(
+                    label,
+                    "mdi-delete",
+                    "/history-delete",
+                    {"ids": [item.history_id]},
+                ))
+            widgets.append({
+                "component": "div",
+                "props": {"class": "d-flex flex-column ga-1 mb-4"},
+                "content": buttons,
+            })
+
+        return widgets
+
+    def _scan_page_widgets(self, mode_label: str) -> List[dict]:
+        """渲染扫描对账部分。"""
+        widgets: List[dict] = []
         report = self._load_report()
+
+        scan_button = self._action_button(
+            "立即扫描媒体库", "mdi-magnify", "/scan", {"action": "scan"}, block=True,
+        )
+
         if report is None:
             widgets.append({
                 "component": "VAlert",
                 "props": {
                     "type": "info",
                     "variant": "tonal",
+                    "class": "mb-3",
                     "title": "还没有扫描结果",
-                    "text": "点下面的「立即扫描」开始，或配置定时扫描。",
+                    "text": "点下面的按钮扫描，或配置定时扫描。",
                 },
             })
-            widgets.append(self._action_button(
-                "立即扫描", "mdi-magnify", "/scan", {"action": "scan"}, color="primary", block=True,
-            ))
+            widgets.append({
+                "component": "div",
+                "props": {"class": "mb-3"},
+                "content": [scan_button],
+            })
             return widgets
 
         orphans = report.orphans
@@ -1835,7 +2279,7 @@ class ScrapeCleaner(_PluginBase):
             "props": {
                 "type": "success" if not orphans else "warning",
                 "variant": "tonal",
-                "class": "mb-4",
+                "class": "mb-3",
                 "title": f"上次扫描：{report.scan_time or '未知时间'}",
                 "text": (
                     f"共扫描 {report.scanned_files} 个文件，"
@@ -1846,17 +2290,13 @@ class ScrapeCleaner(_PluginBase):
             },
         })
 
-        # ---------- 操作按钮区 ----------
-        buttons: List[dict] = [
-            self._action_button("立即扫描", "mdi-magnify", "/scan", {"action": "scan"}),
-        ]
+        buttons: List[dict] = [scan_button]
         if orphans:
-            all_paths = [entry.path for entry in orphans]
             buttons.append(self._action_button(
                 f"清理全部 {len(orphans)} 个残留",
                 "mdi-delete-sweep",
                 "/delete",
-                {"paths": all_paths},
+                {"paths": [entry.path for entry in orphans]},
                 color="error",
             ))
         widgets.append({
@@ -1865,67 +2305,7 @@ class ScrapeCleaner(_PluginBase):
             "content": buttons,
         })
 
-        # ---------- 按目录分组明细 ----------
-        grouped: Dict[str, List[ScrapEntry]] = {}
-        for entry in orphans:
-            grouped.setdefault(os.path.dirname(entry.path), []).append(entry)
-
-        if grouped:
-            # 用 VDataTable 展示明细（V3 里 headers/items 是有效的，
-            # 只有 VTable 需要手写 thead/tbody，两者别搞混）
-            detail_rows: List[dict] = []
-            for entry in orphans[:500]:
-                relative_dir = os.path.dirname(entry.path)
-                detail_rows.append({
-                    "name": os.path.basename(entry.path),
-                    "dir": relative_dir,
-                    "reason": _REASON_LABELS.get(entry.reason.value, entry.reason.value),
-                    "size": _human_size(entry.size),
-                })
-            widgets.append({
-                "component": "VDataTable",
-                "props": {
-                    "density": "compact",
-                    "class": "mb-4",
-                    "headers": [
-                        {"title": "文件", "key": "name"},
-                        {"title": "所在目录", "key": "dir"},
-                        {"title": "判定原因", "key": "reason"},
-                        {"title": "大小", "key": "size"},
-                    ],
-                    "items": detail_rows,
-                    "items-per-page": 15,
-                },
-            })
-            if len(orphans) > 500:
-                widgets.append({
-                    "component": "VAlert",
-                    "props": {
-                        "type": "info",
-                        "variant": "tonal",
-                        "class": "mb-4",
-                        "text": f"明细仅显示前 500 条，共 {len(orphans)} 条。",
-                    },
-                })
-
-            # 每个目录一个「清理本组」按钮，最多列出残留最多的 30 个目录
-            group_buttons: List[dict] = []
-            for directory, items in sorted(
-                grouped.items(), key=lambda kv: len(kv[1]), reverse=True
-            )[:30]:
-                group_buttons.append(self._action_button(
-                    f"清理本组 {len(items)} 个 · {os.path.basename(directory) or directory}",
-                    "mdi-folder-remove",
-                    "/delete",
-                    {"paths": [entry.path for entry in items]},
-                ))
-            widgets.append({"component": "h3", "props": {"class": "mt-4 mb-2"}, "text": "按目录清理"})
-            widgets.append({
-                "component": "div",
-                "props": {"class": "d-flex flex-column ga-2 mb-4"},
-                "content": group_buttons,
-            })
-        else:
+        if not orphans:
             widgets.append({
                 "component": "VAlert",
                 "props": {
@@ -1934,8 +2314,53 @@ class ScrapeCleaner(_PluginBase):
                     "text": "✅ 没有发现残留刮削文件，媒体库很干净。",
                 },
             })
+            return widgets
 
-        # ---------- 清理历史 ----------
+        detail_rows: List[dict] = []
+        for entry in orphans[:500]:
+            detail_rows.append({
+                "name": os.path.basename(entry.path),
+                "dir": os.path.dirname(entry.path),
+                "reason": _REASON_LABELS.get(entry.reason.value, entry.reason.value),
+                "size": _human_size(entry.size),
+            })
+        widgets.append({
+            "component": "VDataTable",
+            "props": {
+                "density": "compact",
+                "class": "mb-4",
+                "headers": [
+                    {"title": "文件", "key": "name"},
+                    {"title": "所在目录", "key": "dir"},
+                    {"title": "判定原因", "key": "reason"},
+                    {"title": "大小", "key": "size"},
+                ],
+                "items": detail_rows,
+                "items-per-page": 15,
+            },
+        })
+
+        grouped: Dict[str, List[ScrapEntry]] = {}
+        for entry in orphans:
+            grouped.setdefault(os.path.dirname(entry.path), []).append(entry)
+        group_buttons: List[dict] = []
+        for directory, entries in sorted(
+            grouped.items(), key=lambda kv: len(kv[1]), reverse=True
+        )[:30]:
+            group_buttons.append(self._action_button(
+                f"清理本组 {len(entries)} 个 · {os.path.basename(directory) or directory}",
+                "mdi-folder-remove",
+                "/delete",
+                {"paths": [entry.path for entry in entries]},
+            ))
+        widgets.append({"component": "h3", "props": {"class": "mt-4 mb-2"}, "text": "按目录清理"})
+        widgets.append({
+            "component": "div",
+            "props": {"class": "d-flex flex-column ga-2 mb-4"},
+            "content": group_buttons,
+        })
+
+        # 清理历史
         try:
             history = self.get_data(HISTORY_DATA_KEY) or []
         except Exception:
@@ -1951,7 +2376,6 @@ class ScrapeCleaner(_PluginBase):
                         {"title": "方式", "key": "mode"},
                         {"title": "处理", "key": "done"},
                         {"title": "跳过", "key": "skipped"},
-                        {"title": "清空目录", "key": "dirs"},
                     ],
                     "items": [
                         {
@@ -1959,7 +2383,6 @@ class ScrapeCleaner(_PluginBase):
                             "mode": "回收站" if item.get("mode") == DeleteMode.RECYCLE else "直接删除",
                             "done": int(item.get("deleted", 0)) + int(item.get("recycled", 0)),
                             "skipped": int(item.get("skipped", 0)),
-                            "dirs": int(item.get("removed_dirs", 0)),
                         }
                         for item in history[:10]
                     ],
@@ -1969,6 +2392,21 @@ class ScrapeCleaner(_PluginBase):
 
         return widgets
 
+
+def _episode_label(item: HistoryItem) -> str:
+    """把一条记录的季集渲染成 S01E01（供按钮文案使用）。"""
+    parts = []
+    if item.season:
+        try:
+            parts.append(f"S{int(item.season):02d}")
+        except (TypeError, ValueError):
+            parts.append(str(item.season))
+    if item.episode:
+        try:
+            parts.append(f"E{int(item.episode):02d}")
+        except (TypeError, ValueError):
+            parts.append(str(item.episode))
+    return "".join(parts)
 
 def _to_ext_set(items: Tuple[str, ...]) -> frozenset[str]:
     """
