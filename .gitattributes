@@ -1,0 +1,6 @@
+# 统一用 LF 换行：插件会在 Linux 容器里读取 UTF-8 源码，
+# 混用 CRLF 虽然不影响 Python，但能让 git diff / 协作更干净。
+* text=auto eol=lf
+
+# 二进制文件不要做换行转换
+*.png binary
